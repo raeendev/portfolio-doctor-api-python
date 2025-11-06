@@ -1,0 +1,266 @@
+// ===== PORTFOLIO DOCTOR DATABASE SCHEMA =====
+// This file is auto-generated. Do not edit manually.
+// Use config/app.config.ts to modify database settings.
+
+generator client {
+  provider = "prisma-client-python"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ===== ENUMS =====
+// Note: SQLite doesn't support enums, using String instead
+// InvestorProfileType: CONSERVATIVE | BALANCED | AGGRESSIVE | STRATEGIST
+// QuestionDimension: MINDSET | PRESSURE_REACTION | RISK_TOLERANCE | TIME_HORIZON | EXPERIENCE_LEVEL | EMOTIONAL_CONTROL
+// InvestorArchetype: PATIENT_ARCHITECT | OPPORTUNISTIC_HUNTER | CONSERVATIVE_GUARDIAN | AGGRESSIVE_BUILDER | BALANCED_STRATEGIST
+// BehavioralBias: LOSS_AVERSION | FOMO_DRIVEN | OVERCONFIDENCE | ANCHORING | HERD_MENTALITY | PANIC_SELLING | GREED_DRIVEN | EMOTIONAL_TRADING
+// AssetTier: CORE | SATELLITE | SPECULATIVE | STRATEGIC_RESERVE
+// UserRole: USER | ADMIN
+
+model User {
+  id              String           @id @default(cuid())
+  email           String           @unique
+  username        String           @unique
+  password        String
+  role            String           @default("USER")
+  isActive        Boolean          @default(true)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  
+  exchangeAPIKeys ExchangeAPIKey[]
+  portfolio       Portfolio?
+  riskProfile     RiskProfile?
+  riskManagement  RiskManagement?
+  tradingPlan     TradingPlan?
+  planViolationLogs PlanViolationLog[]
+  questionnaireAnswers UserQuestionnaireAnswer[]
+}
+
+model ExchangeAPIKey {
+  id        String   @id @default(cuid())
+  userId    String
+  exchange  String   @default("lbank")
+  apiKey    String
+  apiSecret String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, exchange])
+}
+
+model Portfolio {
+  id                    String   @id @default(cuid())
+  userId                String   @unique
+  totalValueUSD         Float    @default(0)
+  costBasis             Float    @default(0)
+  unrealizedPnl         Float    @default(0)
+  unrealizedPnlPercent  Float    @default(0)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  user   User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assets PortfolioAsset[]
+}
+
+model PortfolioAsset {
+  id                    String   @id @default(cuid())
+  portfolioId           String
+  assetSymbol           String
+  totalQuantity         Float
+  totalValueUSD         Float
+  costBasis             Float    @default(0)
+  averageBuyPrice       Float    @default(0)
+  unrealizedPnl         Float    @default(0)
+  unrealizedPnlPercent  Float    @default(0)
+  tier                  String @default("CORE")
+  updatedAt             DateTime @updatedAt
+
+  portfolio Portfolio @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+
+  @@unique([portfolioId, assetSymbol])
+}
+
+model Trade {
+  id            String   @id @default(cuid())
+  userId        String
+  exchange      String
+  symbol        String
+  tradeId       String
+  orderId       String
+  price         Float
+  quantity      Float
+  quoteQuantity Float
+  commission    Float
+  isBuyer       Boolean
+  isMaker       Boolean
+  tradeTime     DateTime
+  createdAt     DateTime @default(now())
+  
+  targetPrice     Float?
+  stopLossPrice   Float?
+  riskRewardRatio Float?
+  riskAmount      Float?
+  expectedReward  Float?
+
+  planViolationLogs PlanViolationLog[]
+
+  @@unique([userId, exchange, tradeId])
+}
+
+model RiskProfile {
+  id           String             @id @default(cuid())
+  userId       String             @unique
+  user         User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  profileType  String
+  
+  riskScore    Int
+  
+  dominantArchetype String?
+  fomoScore         Float?
+  panicSellScore    Float?
+  lossAversionScore Float?
+  overconfidenceScore Float?
+  emotionalControlScore Float?
+  
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+  
+  submissions  QuestionnaireSubmission[]
+}
+
+model QuestionnaireSubmission {
+  id          String    @id @default(cuid())
+  profileId   String
+  profile     RiskProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  
+  answers     String  // JSON stored as String for SQLite
+  version     String
+  
+  createdAt   DateTime  @default(now())
+}
+
+model RiskManagement {
+  id              String   @id @default(cuid())
+  userId          String   @unique
+  maxRiskPerTrade Float    @default(0.01)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model TradingPlan {
+  id             String   @id @default(cuid())
+  userId         String   @unique
+  
+  primaryGoal    String   @default("Long-term capital growth")
+  timeHorizon    String   @default("5+ years")
+  
+  maxDrawdownPercent    Float    @default(0.20)
+  ruleForTakingProfit String   @default("Sell 25% after a 100% gain")
+  ruleForCuttingLosses  String   @default("Never let a trade lose more than 5% of its value")
+  
+  approvedAssets        String  // JSON stored as String for SQLite
+  bannedAssets          String  // JSON stored as String for SQLite
+  entryStrategy         String   @default("Buy during market dips or after a consolidation period")
+  
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model RiskProfileAllocation {
+  id            String   @id @default(cuid())
+  profileType   String
+  tier          String
+  minPercentage Float
+  maxPercentage Float
+
+  @@unique([profileType, tier])
+}
+
+model PlanViolationLog {
+  id            String   @id @default(cuid())
+  userId        String
+  tradeId       String
+  symbol        String
+  violationType String
+  message       String
+  detectedAt    DateTime @default(now())
+
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trade         Trade    @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model QuestionnaireQuestion {
+  id        String            @id @default(cuid())
+  text      String
+  order     Int
+  dimension String
+  isActive  Boolean           @default(true)
+  
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+  
+  options   QuestionnaireOption[]
+  userAnswers UserQuestionnaireAnswer[]
+  
+  @@unique([order, dimension])
+}
+
+model QuestionnaireOption {
+  id         String                @id @default(cuid())
+  questionId String
+  text       String
+  order      Int
+  isActive   Boolean               @default(true)
+  
+  createdAt  DateTime              @default(now())
+  updatedAt  DateTime              @updatedAt
+  
+  question   QuestionnaireQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  scoringRules ScoringRule[]
+  userAnswers UserQuestionnaireAnswer[]
+  
+  @@unique([questionId, order])
+}
+
+model ScoringRule {
+  id        String           @id @default(cuid())
+  optionId  String
+  archetype String?
+  bias      String?
+  score     Float
+  
+  createdAt DateTime           @default(now())
+  updatedAt DateTime           @updatedAt
+  
+  option    QuestionnaireOption @relation(fields: [optionId], references: [id], onDelete: Cascade)
+  
+  @@index([optionId, archetype, bias])
+}
+
+model UserQuestionnaireAnswer {
+  id         String                @id @default(cuid())
+  userId     String
+  questionId String
+  optionId   String
+  answeredAt DateTime              @default(now())
+  
+  user       User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  question   QuestionnaireQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  option     QuestionnaireOption   @relation(fields: [optionId], references: [id], onDelete: Cascade)
+  
+  @@unique([userId, questionId])
+  @@index([userId])
+}
