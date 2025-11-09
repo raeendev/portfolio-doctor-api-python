@@ -5,6 +5,7 @@ import hmac
 import secrets
 import time
 from typing import Dict, List, Optional, Any
+import os
 from datetime import datetime
 from collections import deque
 import httpx
@@ -53,6 +54,18 @@ class LBankService:
             'https://api.lbkex.com',
             'https://api.lbank.info',
         ]
+        contract_env = os.getenv("LBANK_CONTRACT_BASE_URL")
+        if contract_env:
+            self.contract_hosts = [contract_env.rstrip("/")]
+        else:
+            # Official contract REST endpoint (per docs: https://lbkperp.lbank.com/)
+            self.contract_hosts = [
+                "https://lbkperp.lbank.com",
+            ]
+
+        self.contract_asset = os.getenv("LBANK_CONTRACT_ASSET", "USDT")
+        # SwapU = USDT-margined perpetual per docs
+        self.contract_product_group = os.getenv("LBANK_CONTRACT_PRODUCT_GROUP", "SwapU")
         
         # Rate limiters: Orders 500/10s, Others 200/10s
         self.general_rate_limiter = RateLimiter(max_requests=200, window_seconds=10)
@@ -63,20 +76,35 @@ class LBankService:
         self._price_cache_timestamp: float = 0
         self._price_cache_ttl: float = 5.0  # 5 seconds cache
 
+        # Feature flag: allow opting into official connector via env (default: OFF for reliability)
+        self._use_connector = os.getenv("LBANK_USE_CONNECTOR", "false").lower() == "true"
         # Try loading official LBank connector; fall back to manual HTTP if unavailable
         self._connector_available = False
         self._ConnectorClient = None
         try:
-            from lbank.old_api import BlockHttpClient  # type: ignore
-            self._ConnectorClient = BlockHttpClient
-            self._connector_available = True
-            logger.info("lbank-connector-python detected; will use official client")
+            if self._use_connector:
+                from lbank.old_api import BlockHttpClient  # type: ignore
+                self._ConnectorClient = BlockHttpClient
+                self._connector_available = True
+                logger.info("lbank-connector-python detected; using official client per LBANK_USE_CONNECTOR=true")
+            else:
+                logger.info("LBANK_USE_CONNECTOR is false; using manual HTTP signing path")
         except Exception as e:
             logger.info(f"lbank-connector-python not available or failed to import: {e}; falling back to manual HTTP")
     
     def _is_result_true(self, val: Any) -> bool:
         """Check if result is True"""
         return val is True or val == 'true' or val == 'True' or str(val).lower() == 'true'
+
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        """Safely convert to float, returning None on failure."""
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
     
     async def _fetch_server_timestamp(self, base_url: str) -> int:
         """Fetch server timestamp from LBank (public endpoint, no auth needed)"""
@@ -205,13 +233,311 @@ class LBankService:
         
         raise Exception("Max retries exceeded")
 
+    async def _post_contract_signed(
+        self,
+        path: str,
+        api_key: str,
+        api_secret: str,
+        extra_params: Optional[Dict[str, Any]] = None,
+        method: str = "GET",
+    ) -> Dict[str, Any]:
+        """Signed request against the LBank Contract API (futures)."""
+        await self.general_rate_limiter.wait_if_needed()
+
+        last_error: Optional[Exception] = None
+        method = method.upper()
+
+        for base_url in self.contract_hosts:
+            timestamp = await self._fetch_server_timestamp(self.rest_hosts[0])
+
+            params: Dict[str, Any] = {
+                "api_key": api_key,
+                "signature_method": "HmacSHA256",
+                "timestamp": timestamp,
+                "echostr": self._generate_echo_str(),
+            }
+            if extra_params:
+                params.update(extra_params)
+
+            sign = self._sign_params_hmac(params, api_secret)
+            params_with_sign = {**params, "sign": sign}
+
+            headers = {
+                "User-Agent": "PortfolioDoctor/1.0",
+                "Accept": "application/json",
+                "timestamp": str(timestamp),
+                "signature_method": "HmacSHA256",
+                "echostr": params_with_sign["echostr"],
+            }
+
+            request_kwargs: Dict[str, Any]
+            if method == "GET":
+                request_kwargs = {
+                    "params": {k: str(v) for k, v in params_with_sign.items()},
+                    "headers": headers,
+                }
+            else:
+                headers["Content-Type"] = "application/json"
+                request_kwargs = {
+                    "json": params_with_sign,
+                    "headers": headers,
+                }
+
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        response = await client.request(
+                            method,
+                            f"{base_url}{path}",
+                            **request_kwargs,
+                        )
+                        response.raise_for_status()
+                        logger.debug(f"Contract API success via {base_url}{path}")
+                        return response.json()
+                except httpx.TimeoutException:
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2
+                        logger.warning(
+                            f"Contract API timeout ({base_url}{path}), retrying in {wait_time}s "
+                            f"({attempt + 1}/{max_retries})"
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    last_error = None
+                    continue
+                except Exception as exc:
+                    last_error = exc
+                    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                    logger.warning(
+                        f"Contract API request failed ({base_url}{path} - {exc}, status={status_code}), "
+                        f"attempt {attempt + 1}/{max_retries}"
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1)
+                        continue
+                    else:
+                        logger.warning(f"Contract API request failed ({base_url}{path}), trying next host")
+                        break
+
+        if last_error:
+            raise last_error
+        raise Exception("Contract API: all hosts unreachable")
+
+    def _parse_contract_balances(
+        self,
+        payload: Any,
+        price_map: Dict[str, float],
+    ) -> Dict[str, Any]:
+        """Normalize contract account balance payload into assets list."""
+        assets: List[Dict[str, Any]] = []
+        total_value = 0.0
+
+        if isinstance(payload, dict):
+            data = payload.get("data", payload)
+        else:
+            data = payload
+
+        entries: List[Dict[str, Any]] = []
+
+        if isinstance(data, dict):
+            # Some responses keyed by currency, others nested under balances/accountBalance
+            candidate_lists = [
+                data.get("balances"),
+                data.get("accountBalance"),
+                data.get("assets"),
+                data.get("accounts"),
+            ]
+            entries_detected = False
+            for candidate in candidate_lists:
+                if isinstance(candidate, list):
+                    entries.extend([entry for entry in candidate if isinstance(entry, dict)])
+                    entries_detected = True
+            if not entries_detected:
+                # treat dict itself as a single entry
+                entries.append(data)
+        elif isinstance(data, list):
+            entries.extend([entry for entry in data if isinstance(entry, dict)])
+
+        stablecoins = {"USDT", "USDC", "TUSD", "USDD", "BUSD"}
+
+        for entry in entries:
+            currency = str(entry.get("asset") or entry.get("currency") or entry.get("symbol") or "USDT").upper()
+
+            margin_balance = self._safe_float(
+                entry.get("marginBalance")
+                or entry.get("equity")
+                or entry.get("balance")
+                or entry.get("cashBalance")
+                or entry.get("asset")
+            )
+            available_balance = self._safe_float(
+                entry.get("availableBalance")
+                or entry.get("available")
+                or entry.get("withdrawAvailable")
+                or entry.get("cashBalance")
+            )
+            frozen_balance = None
+            if margin_balance is not None and available_balance is not None:
+                frozen_balance = max(margin_balance - available_balance, 0.0)
+
+            unrealized = self._safe_float(entry.get("unrealizedPnl") or entry.get("unrealized") or entry.get("profit"))
+
+            # Determine USD valuation
+            value_usd: Optional[float] = None
+            price_usd: Optional[float] = None
+            amount_reference = margin_balance if margin_balance is not None else available_balance
+
+            if amount_reference is None:
+                continue
+
+            if currency in stablecoins:
+                price_usd = 1.0
+                value_usd = amount_reference
+            else:
+                price_usd = self._get_price_from_map(currency, price_map)
+                if price_usd:
+                    value_usd = amount_reference * price_usd
+
+            assets.append(
+                {
+                    "symbol": currency,
+                    "free": available_balance if available_balance is not None else amount_reference,
+                    "frozen": frozen_balance if frozen_balance is not None else 0.0,
+                    "quantity": margin_balance if margin_balance is not None else amount_reference,
+                    "priceUSD": price_usd,
+                    "valueUSD": value_usd,
+                    "unrealizedPnl": unrealized,
+                    "accountType": "FUTURES",
+                }
+            )
+
+            if value_usd is not None:
+                total_value += value_usd
+
+        return {"totalValueUSD": total_value, "assets": assets}
+
+    def _parse_contract_positions(
+        self,
+        payload: Any,
+        price_map: Dict[str, float],
+    ) -> List[Dict[str, Any]]:
+        """Normalize contract positions list (best effort)."""
+        if isinstance(payload, dict):
+            data = payload.get("data", payload)
+        else:
+            data = payload
+
+        if isinstance(data, dict) and isinstance(data.get("positions"), list):
+            positions_raw = data.get("positions")
+        elif isinstance(data, list):
+            positions_raw = data
+        else:
+            positions_raw = []
+
+        positions: List[Dict[str, Any]] = []
+        for entry in positions_raw:
+            if not isinstance(entry, dict):
+                continue
+
+            symbol = str(entry.get("symbol") or entry.get("contract") or entry.get("pair") or "").upper()
+            if not symbol:
+                continue
+
+            side = str(entry.get("side") or entry.get("direction") or entry.get("positionSide") or "").upper()
+            size = self._safe_float(entry.get("size") or entry.get("volume") or entry.get("positionAmt") or entry.get("qty"))
+            entry_price = self._safe_float(entry.get("entryPrice") or entry.get("avgPrice") or entry.get("openPrice"))
+            mark_price = self._safe_float(entry.get("markPrice") or entry.get("lastPrice"))
+            leverage = entry.get("leverage") or entry.get("leverRate")
+            unrealized = self._safe_float(entry.get("unrealizedPnl") or entry.get("profit"))
+
+            notional_value = None
+            price_for_value = mark_price or entry_price
+            if size is not None and price_for_value:
+                notional_value = size * price_for_value
+            elif size is not None and symbol.endswith("USDT"):
+                notional_value = size
+                price_for_value = 1.0
+            elif size is not None:
+                mapped_price = self._get_price_from_map(symbol.replace("USDT", ""), price_map)
+                if mapped_price:
+                    notional_value = size * mapped_price
+                    price_for_value = mapped_price
+
+            positions.append(
+                {
+                    "symbol": symbol,
+                    "side": side,
+                    "quantity": size,
+                    "entryPrice": entry_price,
+                    "markPrice": mark_price,
+                    "leverage": leverage,
+                    "unrealizedPnl": unrealized,
+                    "notionalValueUSD": notional_value,
+                }
+            )
+
+        return positions
+
+    async def _legacy_futures_balances(self, api_key: str, api_secret: str, price_map: Dict[str, float]) -> Dict[str, Any]:
+        """Fallback to legacy supplement endpoint (spot-style account) if contract API unavailable."""
+        data = await self._get_trade_balances(api_key, api_secret)
+        if not self._is_result_true(data.get("result")):
+            error_code = data.get("error_code", "Unknown")
+            error_msg = data.get("msg") or data.get("error_msg", "Unknown error")
+            raise Exception(f"LBank API error: {error_code} - {error_msg}")
+
+        info = data.get("info") or data.get("data") or data
+        balances = info.get("balances", []) if isinstance(info, dict) else []
+        free_obj: Dict[str, float] = {}
+        freeze_obj: Dict[str, float] = {}
+        if isinstance(balances, list) and balances:
+            for bal in balances:
+                sym = str(bal.get("asset", "")).upper()
+                if not sym:
+                    continue
+                free_obj[sym] = float(bal.get("free", 0) or 0)
+                freeze_obj[sym] = float(bal.get("locked", 0) or 0)
+        else:
+            if isinstance(info, dict):
+                if isinstance(info.get("free"), dict):
+                    for k, v in info["free"].items():
+                        free_obj[str(k).upper()] = float(v or 0)
+                if isinstance(info.get("freeze"), dict):
+                    for k, v in info["freeze"].items():
+                        freeze_obj[str(k).upper()] = float(v or 0)
+
+        items: List[Dict[str, Any]] = []
+        total_value = 0.0
+        for sym in sorted(set(list(free_obj.keys()) + list(freeze_obj.keys()))):
+            qty = float(free_obj.get(sym, 0)) + float(freeze_obj.get(sym, 0))
+            if qty <= 0:
+                continue
+            price = self._get_price_from_map(sym, price_map)
+            value = qty * price if price and price > 0 else None
+            if value:
+                total_value += value
+            items.append(
+                {
+                    "symbol": sym,
+                    "free": float(free_obj.get(sym, 0)),
+                    "frozen": float(freeze_obj.get(sym, 0)),
+                    "quantity": qty,
+                    "priceUSD": price if price and price > 0 else None,
+                    "valueUSD": value,
+                    "accountType": "FUTURES",
+                }
+            )
+
+        return {"totalValueUSD": total_value, "assets": items, "positions": []}
+
     async def _connector_request(
         self,
         method: str,
         api_path: str,
         api_key: str,
         api_secret: str,
-        payload: Optional[Dict[str, Any]] = None,
+        extra_params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Use official connector client synchronously inside thread, wrapped for async."""
         if not self._connector_available or self._ConnectorClient is None:
@@ -220,16 +546,27 @@ class LBankService:
         # Respect rate limiting for private endpoints
         await self.general_rate_limiter.wait_if_needed()
 
+        # Build required params (the connector does not inject api_key/signature params by itself)
+        timestamp = await self._fetch_server_timestamp("https://api.lbkex.com")
+        base_params: Dict[str, Any] = {
+            "api_key": api_key,
+            "signature_method": "HmacSHA256",
+            "timestamp": timestamp,
+            "echostr": self._generate_echo_str(),
+        }
+        if extra_params:
+            base_params.update(extra_params)
+
         def _sync_call() -> Dict[str, Any]:
             client = self._ConnectorClient(
                 sign_method="HmacSHA256",
                 api_key=api_key,
                 api_secret=api_secret,
                 base_url="https://api.lbkex.com/",
-                is_json=True,
+                is_json=False,
                 log_level=logging.WARNING,
             )
-            return client.http_request(method.lower(), api_path, payload=payload or {})  # type: ignore[arg-type]
+            return client.http_request(method.lower(), api_path, payload=base_params)  # type: ignore[arg-type]
 
         # Run blocking client in a thread
         return await asyncio.to_thread(_sync_call)
@@ -249,7 +586,7 @@ class LBankService:
                     api_path="v2/supplement/user_info.do",
                     api_key=api_key,
                     api_secret=api_secret,
-                    payload={},
+                    extra_params={},
                 )
                 
                 # Handle direct array response (per LBank docs example)
@@ -325,7 +662,7 @@ class LBankService:
                     api_path="v2/supplement/user_info_account.do",
                     api_key=api_key,
                     api_secret=api_secret,
-                    payload={},
+                    extra_params={},
                 )
                 if self._is_result_true(data.get('result')):
                     return data
@@ -708,7 +1045,7 @@ class LBankService:
                         "lastUpdated": datetime.utcnow().isoformat()
                     })
             
-            # Process futures/trade account balances
+            # Process futures/trade account balances (do NOT merge into spot assets list)
             # Per LBank docs: /v2/supplement/user_info_account.do returns:
             # {"canTrade": true, "balances": [{"asset": "BTC", "free": "...", "locked": "..."}]}
             if trade_info:
@@ -737,71 +1074,71 @@ class LBankService:
                 
                 all_symbols = set(list(free_obj.keys()) + list(freeze_obj.keys()))
                 
-                for sym in all_symbols:
-                    symbol = str(sym).upper()
-                    if not symbol:
-                        continue
-                    
-                    free = float(free_obj.get(sym, 0))
-                    frozen = float(freeze_obj.get(sym, 0))
-                    qty = free + frozen
-                    
-                    if qty <= 0:
-                        continue
-                    
-                    try:
-                        price = self._get_price_from_map(symbol, price_map)
-                        current_price = price if price and price > 0 else None
-                        value_usd = qty * current_price if current_price else None
-                        
-                        # Check if asset already exists (SPOT)
-                        existing_idx = next(
-                            (i for i, a in enumerate(assets) if a['symbol'] == symbol),
-                            None
-                        )
-                        
-                        if existing_idx is not None:
-                            # Merge with existing asset
-                            existing = assets[existing_idx]
-                            combined_qty = existing['quantity'] + qty
-                            combined_val = (existing['valueUSD'] or 0) + (value_usd or 0)
-                            assets[existing_idx] = {
-                                **existing,
-                                "quantity": combined_qty,
-                                "valueUSD": combined_val,
-                                "accountType": "COMBINED",
-                                "lastUpdated": datetime.utcnow().isoformat()
-                            }
-                        else:
-                            assets.append({
-                                "id": f"lbank-trade-{symbol.lower()}-{int(time.time() * 1000)}",
-                                "symbol": symbol,
-                                "quantity": qty,
-                                "free": free,
-                                "frozen": frozen,
-                                "priceUSD": current_price,
-                                "valueUSD": value_usd,
-                                "costBasis": 0,
-                                "averageBuyPrice": 0,
-                                "unrealizedPnl": 0,
-                                "unrealizedPnlPercent": 0,
-                                "tier": self._get_asset_tier(symbol),
-                                "accountType": "FUTURES",
-                                "lastUpdated": datetime.utcnow().isoformat()
-                            })
-                        
-                        if value_usd:
-                            total_value_usd += value_usd
-                    except Exception as e:
-                        logger.warning(f"Failed to process trade asset {symbol}: {e}")
+                # Skip adding futures into assets here. The portfolio service will fetch
+                # futures balances separately through get_futures_balances and compose
+                # the final totals accurately without double counting.
             
-            logger.info(f"Portfolio: ${total_value_usd:.2f} USD, {len(assets)} assets")
-            
+            # Recalculate total strictly from final asset list to avoid any double counting
+            total_value_usd_final = 0.0
+            for a in assets:
+                try:
+                    val = float(a.get("valueUSD") or 0)
+                except Exception:
+                    val = 0.0
+                total_value_usd_final += val
+            logger.info(f"Portfolio: ${total_value_usd_final:.2f} USD, {len(assets)} assets")
+
             return {
-                "totalValueUSD": total_value_usd,
+                "totalValueUSD": total_value_usd_final,
                 "costBasis": 0,  # Not available from LBank API
                 "assets": assets,
             }
         except Exception as e:
             logger.error(f"LBank portfolio error: {e}", exc_info=True)
             raise Exception(f"Failed to fetch portfolio from LBank: {e}")
+
+    async def get_futures_balances(self, api_key: str, api_secret: str) -> Dict[str, Any]:
+        """Return parsed futures/contract account balances as a flat list with USD value estimates."""
+        price_map = await self._get_all_prices_optimized()
+
+        # Attempt contract API first (accurate futures data)
+        try:
+            contract_balance = await self._post_contract_signed(
+                "/cfd/openApi/v1/prv/account",
+                api_key,
+                api_secret,
+                {
+                    "asset": self.contract_asset,
+                    "productGroup": self.contract_product_group,
+                },
+            )
+            if self._is_result_true(contract_balance.get("result")):
+                normalized = self._parse_contract_balances(contract_balance, price_map)
+
+                # Try to enrich with positions (best effort, optional)
+                positions: List[Dict[str, Any]] = []
+                try:
+                    contract_positions = await self._post_contract_signed(
+                        "/cfd/openApi/v1/prv/position",
+                        api_key,
+                        api_secret,
+                        {
+                            "asset": self.contract_asset,
+                            "productGroup": self.contract_product_group,
+                        },
+                    )
+                    if self._is_result_true(contract_positions.get("result")):
+                        positions = self._parse_contract_positions(contract_positions, price_map)
+                except Exception as pos_exc:
+                    logger.debug(f"Failed to fetch contract positions: {pos_exc}")
+
+                normalized["positions"] = positions
+                return normalized
+            else:
+                logger.warning(f"Contract balance API returned result={contract_balance.get('result')}, falling back")
+        except Exception as contract_exc:
+            logger.warning(f"Contract API fetch failed, falling back to supplement endpoint: {contract_exc}")
+
+        # Fallback: legacy supplement endpoint (may mirror spot values)
+        return await self._legacy_futures_balances(api_key, api_secret, price_map)
+        

@@ -17,6 +17,13 @@ class PortfolioService:
     
     def __init__(self):
         self.lbank_service = LBankService()
+
+    @staticmethod
+    def _safe_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
     
     async def get_portfolio(self, user_id: str) -> Dict[str, Any]:
         """Get user portfolio"""
@@ -62,36 +69,34 @@ class PortfolioService:
                             ),
                             timeout=30.0
                         )
+                        # Fetch futures balances detail (non-blocking but with same timeout envelope)
+                        futures_detail = await asyncio.wait_for(
+                            self.lbank_service.get_futures_balances(
+                                lbank_conn.apiKey,
+                                lbank_conn.apiSecret
+                            ),
+                            timeout=30.0
+                        )
                         
-                        # Build account breakdown from live assets
-                        spot_value = 0.0
-                        futures_value = 0.0
-                        margin_value = 0.0
-                        funding_value = 0.0
-                        
-                        assets_list = live_data.get("assets", [])
-                        logger.info(f"Processing {len(assets_list)} live assets for account breakdown")
-                        
-                        for asset in assets_list:
-                            value = float(asset.get("valueUSD", 0) or 0)
-                            account_type = asset.get("accountType", "SPOT")
-                            
-                            if account_type == "SPOT":
-                                spot_value += value
-                            elif account_type == "FUTURES":
-                                futures_value += value
-                            elif account_type == "COMBINED":
-                                # For combined, split between spot and futures based on account type
-                                # Since we don't have breakdown, add to spot (main account)
-                                spot_value += value * 0.7  # Approximate 70% spot
-                                futures_value += value * 0.3  # Approximate 30% futures
-                            # Note: margin and funding not available from LBank API currently
-                        
-                        total = float(live_data.get("totalValueUSD", 0) or 0)
-                        
-                        # Use calculated values or fallback to total
-                        spot_total = spot_value if spot_value > 0 else (total - futures_value)
-                        futures_total = futures_value
+                        # Build account breakdown precisely from spot and futures (no heuristics)
+                        assets_list = live_data.get("assets", [])  # spot assets only
+                        logger.info(f"Processing {len(assets_list)} live spot assets for account breakdown")
+
+                        spot_total = sum(float(a.get("valueUSD") or 0) for a in assets_list)
+
+                        futures_detail = await asyncio.wait_for(
+                            self.lbank_service.get_futures_balances(
+                                lbank_conn.apiKey,
+                                lbank_conn.apiSecret
+                            ),
+                            timeout=30.0
+                        )
+                        futures_assets = futures_detail.get("assets", []) if isinstance(futures_detail, dict) else []
+                        futures_positions = futures_detail.get("positions", []) if isinstance(futures_detail, dict) else []
+                        futures_total = sum(float(a.get("valueUSD") or 0) for a in futures_assets)
+
+                        # Heuristic: avoid double counting when futures mirrors spot stablecoin wallet (common on accounts without futures activity)
+                        total = spot_total + futures_total
                         
                         logger.info(f"Account breakdown - Total: ${total:.2f}, Spot: ${spot_total:.2f}, Futures: ${futures_total:.2f}")
                         
@@ -112,8 +117,10 @@ class PortfolioService:
                             },
                             "timeZone": "UTC+8",
                             "timestampUTC8": datetime.utcnow().isoformat(),
-                            "assets": live_data.get("assets", []),
+                            "assets": assets_list,
                             "futuresBalanceUSD": futures_total,
+                            "futuresAssets": futures_assets,
+                            "futuresPositions": futures_positions,
                             "openPositions": [],
                             "tradeHistory": [],
                             "pnl": {
@@ -280,3 +287,120 @@ class PortfolioService:
                 "syncedExchanges": [ex.exchange for ex in connected_exchanges],
                 "lastSyncTime": datetime.utcnow().isoformat(),
             }
+
+    async def get_spot_portfolio_overview(self, user_id: str) -> Dict[str, Any]:
+        """Return spot-only portfolio snapshot"""
+        with get_db() as db:
+            lbank_conn = db.query(ExchangeAPIKey).filter(
+                ExchangeAPIKey.userId == user_id,
+                ExchangeAPIKey.exchange == "lbank",
+                ExchangeAPIKey.isActive == True,
+            ).first()
+
+        if not lbank_conn:
+            return {
+                "exchange": None,
+                "assetCount": 0,
+                "totalValueUSD": 0.0,
+                "assets": [],
+                "updatedAt": datetime.utcnow().isoformat(),
+            }
+
+        live_data = await self.lbank_service.get_portfolio_data(
+            lbank_conn.apiKey,
+            lbank_conn.apiSecret,
+        )
+        assets_raw = live_data.get("assets", []) if isinstance(live_data, dict) else []
+        normalized_assets = []
+        total_value = 0.0
+
+        for asset in assets_raw:
+            value = self._safe_float(asset.get("valueUSD"))
+            total_value += value
+            normalized_assets.append({
+                "symbol": asset.get("symbol"),
+                "quantity": self._safe_float(asset.get("quantity")),
+                "free": self._safe_float(asset.get("free")),
+                "frozen": self._safe_float(asset.get("frozen")),
+                "priceUSD": self._safe_float(asset.get("priceUSD")),
+                "valueUSD": value,
+                "tier": asset.get("tier"),
+                "accountType": asset.get("accountType", "SPOT"),
+                "lastUpdated": asset.get("lastUpdated") or datetime.utcnow().isoformat(),
+            })
+
+        return {
+            "exchange": lbank_conn.exchange,
+            "assetCount": len(normalized_assets),
+            "totalValueUSD": total_value,
+            "assets": normalized_assets,
+            "updatedAt": datetime.utcnow().isoformat(),
+        }
+
+    async def get_futures_portfolio_overview(self, user_id: str) -> Dict[str, Any]:
+        """Return futures-only portfolio snapshot including positions"""
+        with get_db() as db:
+            lbank_conn = db.query(ExchangeAPIKey).filter(
+                ExchangeAPIKey.userId == user_id,
+                ExchangeAPIKey.exchange == "lbank",
+                ExchangeAPIKey.isActive == True,
+            ).first()
+
+        if not lbank_conn:
+            return {
+                "exchange": None,
+                "assetCount": 0,
+                "positionCount": 0,
+                "totalValueUSD": 0.0,
+                "assets": [],
+                "positions": [],
+                "updatedAt": datetime.utcnow().isoformat(),
+            }
+
+        futures_data = await self.lbank_service.get_futures_balances(
+            lbank_conn.apiKey,
+            lbank_conn.apiSecret,
+        )
+
+        assets_raw = futures_data.get("assets", []) if isinstance(futures_data, dict) else []
+        positions_raw = futures_data.get("positions", []) if isinstance(futures_data, dict) else []
+
+        normalized_assets = []
+        total_value = 0.0
+        for asset in assets_raw:
+            value = self._safe_float(asset.get("valueUSD"))
+            total_value += value
+            normalized_assets.append({
+                "symbol": asset.get("symbol"),
+                "quantity": self._safe_float(asset.get("quantity")),
+                "free": self._safe_float(asset.get("free")),
+                "frozen": self._safe_float(asset.get("frozen")),
+                "priceUSD": self._safe_float(asset.get("priceUSD")),
+                "valueUSD": value,
+                "accountType": "FUTURES",
+            })
+
+        normalized_positions = []
+        for position in positions_raw:
+            normalized_positions.append({
+                "symbol": position.get("symbol"),
+                "side": position.get("side"),
+                "quantity": self._safe_float(position.get("quantity")),
+                "entryPrice": self._safe_float(position.get("entryPrice")),
+                "markPrice": self._safe_float(position.get("markPrice")),
+                "leverage": position.get("leverage"),
+                "unrealizedPnl": self._safe_float(position.get("unrealizedPnl")),
+                "notionalValueUSD": self._safe_float(position.get("notionalValueUSD")),
+            })
+
+        total_value = self._safe_float(futures_data.get("totalValueUSD")) if isinstance(futures_data, dict) else total_value
+
+        return {
+            "exchange": lbank_conn.exchange,
+            "assetCount": len(normalized_assets),
+            "positionCount": len(normalized_positions),
+            "totalValueUSD": total_value,
+            "assets": normalized_assets,
+            "positions": normalized_positions,
+            "updatedAt": datetime.utcnow().isoformat(),
+        }
